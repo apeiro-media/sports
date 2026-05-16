@@ -29,8 +29,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
-import cloudscraper
-from requests.exceptions import RequestException
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests.exceptions import RequestException
 
 API = "https://api.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
 
@@ -54,20 +54,21 @@ def _install_signal_handlers() -> None:
 
 # ---------- shared scraper session ----------
 #
-# A single shared session warmed up once at startup. Earlier per-thread
-# sessions made every worker solve a fresh Cloudflare JS challenge in
-# parallel, which Cloudflare flagged as bot traffic and answered with 403s
-# across the board. requests.Session (which CloudScraper subclasses) is safe
-# for concurrent GETs once its cookies are populated.
+# curl_cffi impersonates real Chrome at the TLS/JA3 layer, which is what
+# Cloudflare actually fingerprints. cloudscraper (pure Python) failed on
+# GitHub-hosted runners because its TLS signature is recognisably non-Chrome.
+#
+# One Session object shared across all workers — curl_cffi sessions are safe
+# for concurrent GETs.
+
+IMPERSONATE = "chrome"
 
 _scraper_lock = threading.Lock()
-_scraper_obj: cloudscraper.CloudScraper | None = None
+_scraper_obj: Optional[cffi_requests.Session] = None
 
 
-def _build_scraper() -> cloudscraper.CloudScraper:
-    s = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "darwin", "mobile": False}
-    )
+def _build_scraper() -> cffi_requests.Session:
+    s = cffi_requests.Session(impersonate=IMPERSONATE)
     s.headers.update({
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -77,7 +78,7 @@ def _build_scraper() -> cloudscraper.CloudScraper:
     return s
 
 
-def _scraper() -> cloudscraper.CloudScraper:
+def _scraper() -> cffi_requests.Session:
     global _scraper_obj
     s = _scraper_obj
     if s is None:
