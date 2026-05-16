@@ -1,0 +1,143 @@
+name: Fetch Sofascore football archive
+
+# Triggers:
+#   - workflow_dispatch: kick off manually from the Actions tab with custom inputs
+#   - schedule:          (commented out by default) re-runs every N hours so the
+#                        archive incrementally fills in unattended
+#
+# State strategy:
+#   The fetcher is resumable — it skips any `football/YYYY.MM.DD.json` that
+#   already exists. We keep those files on a dedicated orphan branch named
+#   `data`, never on `main`. Each run checks out `data` into a sub-folder,
+#   appends newly-fetched days, and pushes back to `data`.
+#
+#   This keeps `main` clean (just code) and lets you `git fetch origin data`
+#   from a workstation to mirror the archive locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'Start date (YYYY-MM-DD) — Sofascore data starts 1930-07-13'
+        default: '1930-07-13'
+        required: true
+      end:
+        description: 'End date (YYYY-MM-DD)'
+        default: '2026-12-31'
+        required: true
+      workers:
+        description: 'Concurrent workers (keep <= 4 to avoid Cloudflare flags)'
+        default: '4'
+        required: true
+      reverse:
+        description: 'Iterate newest-first (useful for resuming from today)'
+        type: boolean
+        default: false
+  # Uncomment to run automatically every 6 hours until the archive is complete:
+  # schedule:
+  #   - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+
+# Prevent two fetch runs from racing on the data branch.
+concurrency:
+  group: fetch-sofa
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    # GitHub Actions hard caps free runners at 6h. Leave a 10-min margin so the
+    # commit/push step actually runs even if the fetcher gets killed.
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout source (main)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --quiet cloudscraper
+
+      - name: Checkout data branch (or initialize)
+        run: |
+          set -euo pipefail
+          git config --global user.name  'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          mkdir -p data
+          cd data
+          git init -q -b data
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            echo "Existing data branch found — fetching it shallowly."
+            git fetch --depth=1 origin data
+            git reset --hard origin/data
+          else
+            echo "No data branch yet — starting fresh."
+            git commit --allow-empty -q -m "Initial commit on data branch"
+          fi
+
+          mkdir -p football
+          echo "Existing fetched files: $(ls football/ 2>/dev/null | wc -l)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Fetch
+        # continue-on-error so a partial fetch still commits its progress
+        continue-on-error: true
+        timeout-minutes: 330
+        run: |
+          python fetch_sofa.py \
+            --start '${{ inputs.start }}' \
+            --end   '${{ inputs.end }}' \
+            --workers ${{ inputs.workers }} \
+            --out-dir data/football \
+            --log-file data/fetch_sofa.log \
+            --failures-file data/fetch_sofa.failures.txt \
+            ${{ inputs.reverse && '--reverse' || '' }}
+
+      - name: Commit and push progress
+        working-directory: data
+        run: |
+          set -euo pipefail
+          git add football/ fetch_sofa.log fetch_sofa.failures.txt 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          new_files=$(git diff --cached --name-only --diff-filter=A 'football/' | wc -l | tr -d ' ')
+          modified=$(git diff --cached --name-only --diff-filter=M 'football/' | wc -l | tr -d ' ')
+
+          git commit -q -m "data: +${new_files} new, ~${modified} updated ($(date -u +%FT%TZ))"
+          git push origin HEAD:data
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Run summary"
+            echo ""
+            echo "**Range:** \`${{ inputs.start }}\` → \`${{ inputs.end }}\`"
+            echo "**Workers:** ${{ inputs.workers }}"
+            echo ""
+            echo "**Archive size on data branch:**"
+            echo "- files: $(ls data/football 2>/dev/null | wc -l | tr -d ' ')"
+            echo "- bytes: $(du -sh data/football 2>/dev/null | cut -f1)"
+            echo ""
+            if [ -s data/fetch_sofa.failures.txt ]; then
+              echo "**Failures this run:** $(wc -l < data/fetch_sofa.failures.txt) — see \`fetch_sofa.failures.txt\` on the data branch."
+            else
+              echo "**Failures this run:** 0"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

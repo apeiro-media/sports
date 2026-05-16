@@ -1,0 +1,17 @@
+# Fetched data lives on the `data` branch, never on `main`.
+football/
+
+# Runtime artifacts
+*.log
+fetch_sofa.failures.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
